@@ -1,7 +1,5 @@
 fastapi
 uvicorn
-transformers
-sentencepiece
+requests
 langdetect
 cachetools
-torch==2.0.1+cpu
