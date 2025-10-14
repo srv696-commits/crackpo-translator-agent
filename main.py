@@ -8,6 +8,7 @@ from transformers import pipeline
 from langdetect import detect
 from cachetools import TTLCache
 from hashlib import sha256
+import torch
 import os
 
 # === Configuration ===
