@@ -4,4 +4,3 @@ transformers
 sentencepiece
 langdetect
 cachetools
-torch
