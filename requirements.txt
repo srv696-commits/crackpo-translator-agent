@@ -4,4 +4,4 @@ transformers
 sentencepiece
 langdetect
 cachetools
-torch
+torch==2.0.1+cpu
