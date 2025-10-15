@@ -1,235 +1,188 @@
-# ===========================================================
-# CrackPO Translator — HF + OpenAI fallback, CORS, chunking, cache
-# ===========================================================
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from langdetect import detect
-from cachetools import TTLCache
-import requests, os, json, hashlib, time, math
+import os
+import json
+import time
+import threading
+import requests
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from openai import OpenAI
 
-# ---------- Config ----------
-API_KEY = os.getenv("TRANSLATOR_API_KEY", "crackpo123")
-HF_TOKEN = os.getenv("HF_API_TOKEN", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+# ------------------ CONFIG ------------------
+app = Flask(__name__)
+CORS(app)
 
-# Order can be "hf,openai" (default) or "openai,hf"
-PROVIDER_ORDER = [p.strip() for p in os.getenv("PROVIDER_ORDER", "hf,openai").split(",")]
+HF_TOKEN = os.getenv("HF_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+API_KEY = os.getenv("API_KEY", "crackpo123")
 
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+PROVIDER_ORDER = os.getenv("PROVIDER_ORDER", "openai,hf").split(",")
+FAST_FALLBACK_MS = int(os.getenv("FAST_FALLBACK_MS", "6000"))  # 6 sec
+MAX_RETRIES = 3
 
 HF_ENDPOINTS = {
     "hi": "https://api-inference.huggingface.co/models/Helsinki-NLP/opus-mt-en-hi",
     "kn": "https://api-inference.huggingface.co/models/Helsinki-NLP/opus-mt-en-kn",
-    "te": "https://api-inference.huggingface.co/models/Helsinki-NLP/opus-mt-en-te",
+    "te": "https://api-inference.huggingface.co/models/Helsinki-NLP/opus-mt-en-te"
 }
 
-LANG_NAME = {"hi": "Hindi", "kn": "Kannada", "te": "Telugu"}
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-translation_cache = TTLCache(maxsize=800, ttl=3600)
+# ------------------ HELPERS ------------------
 
-# ---------- App ----------
-app = FastAPI(title="CrackPO Translator (HF + OpenAI)")
+def chunk_text(text, max_len=1000):
+    """Split long text into manageable pieces."""
+    chunks, cur = [], []
+    count = 0
+    for line in text.splitlines(True):
+        count += len(line)
+        cur.append(line)
+        if count >= max_len:
+            chunks.append("".join(cur))
+            cur, count = [], 0
+    if cur:
+        chunks.append("".join(cur))
+    return chunks
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "x-api-key"],
-)
 
-# ---------- Helpers ----------
-def cache_key(text: str, tgt: str, provider: str) -> str:
-    return hashlib.sha256(f"{tgt}:{provider}:{text}".encode()).hexdigest()
-
-def chunk_text(text: str, max_len: int = 1500):
-    """Split text into manageable chunks on paragraph boundaries."""
-    paras = [p for p in text.split("\n\n") if p.strip()]
-    chunks, buf = [], ""
-    for p in paras:
-        if len(buf) + len(p) + 2 <= max_len:
-            buf = (buf + "\n\n" + p) if buf else p
-        else:
-            if buf:
-                chunks.append(buf)
-            if len(p) <= max_len:
-                buf = p
-            else:
-                # hard-split very long paragraphs
-                for i in range(0, len(p), max_len):
-                    part = p[i : i + max_len]
-                    if i == 0 and not buf:
-                        buf = part
-                    else:
-                        chunks.append(buf)
-                        buf = part
-    if buf:
-        chunks.append(buf)
-    return chunks or [text]
-
-def call_hf(model_url: str, text: str, attempts: int = 3, timeout: int = 60) -> str:
+def call_hf(model_url: str, text: str, timeout: int = 60) -> str:
     headers = {"Authorization": f"Bearer {HF_TOKEN}", "Content-Type": "application/json"}
     payload = json.dumps({"inputs": text})
-    last_error = None
-    for i in range(attempts):
-        try:
-            resp = requests.post(model_url, headers=headers, data=payload, timeout=timeout)
-            print("HF STATUS:", resp.status_code)
-            print("HF RAW:", resp.text[:300])
-            if resp.status_code in (503, 504):
-                time.sleep(2 ** i)
-                continue
-            out = resp.json()
-            if isinstance(out, list) and out and "translation_text" in out[0]:
-                return out[0]["translation_text"]
-            if isinstance(out, dict) and "error" in out:
-                last_error = out["error"]
-                # retry if model is loading
-                if "loading" in out["error"].lower():
-                    time.sleep(2 ** i)
-                    continue
-                break
-            last_error = f"Unexpected HF response: {out}"
-        except Exception as e:
-            last_error = str(e)
-            time.sleep(2 ** i)
-    raise RuntimeError(last_error or "HF translation failed")
+    r = requests.post(model_url, headers=headers, data=payload, timeout=timeout)
+    if not r.ok:
+        raise RuntimeError(f"HF error {r.status_code}: {r.text}")
+    data = r.json()
+    if isinstance(data, list) and len(data) and "translation_text" in data[0]:
+        return data[0]["translation_text"]
+    raise RuntimeError(f"Unexpected HF output: {data}")
+
 
 def call_openai(text: str, tgt: str) -> str:
-    """
-    Use OpenAI as a fallback (or primary if requested).
-    Requires OPENAI_API_KEY.
-    """
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is not configured")
-
-    # lazy import to keep cold start small
-    from openai import OpenAI
-    client = OpenAI(api_key=OPENAI_API_KEY)
-
-    system = (
-        "You are a precise translation engine. "
-        "Translate the user's content into the specified target language. "
-        "Preserve markdown formatting, lists, headings, math/LaTeX, and code blocks. "
-        "Do not add explanations or extra text; return only the translated content."
+    """Use GPT model for translation (fast + stable)."""
+    prompt = f"Translate this English text to {tgt} (keep markdown):\n\n{text}"
+    resp = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
     )
-    target_name = LANG_NAME.get(tgt, tgt)
+    return resp.choices[0].message.content.strip()
 
-    # Chunk to avoid context limits and HF-like failures
-    chunks = chunk_text(text, max_len=1500)
-    translated_chunks = []
 
-    for idx, ch in enumerate(chunks, start=1):
-        msg = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": f"Target language: {target_name} ({tgt}).\n\nText:\n{ch}"},
-        ]
-        # Use a small, cheap, strong model
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=msg,
-            temperature=0.2,
-        )
-        out = resp.choices[0].message.content.strip()
-        translated_chunks.append(out)
-
-    return "\n\n".join(translated_chunks)
-
-def translate_with_provider(provider: str, text: str, tgt: str) -> str:
+def translate_with_provider(text: str, tgt: str, provider: str) -> tuple[str, str]:
+    """Explicitly choose provider."""
     if provider == "hf":
-        if not HF_TOKEN:
-            raise RuntimeError("HF_API_TOKEN is not configured")
-        model_url = HF_ENDPOINTS.get(tgt)
-        if not model_url:
-            raise RuntimeError(f"Unsupported target_lang '{tgt}' for HF")
-        return call_hf(model_url, text)
+        model = HF_ENDPOINTS.get(tgt)
+        if not model:
+            raise RuntimeError(f"No HF model for {tgt}")
+        return call_hf(model, text), "hf"
     elif provider == "openai":
-        return call_openai(text, tgt)
-    else:
-        raise RuntimeError(f"Unknown provider '{provider}'")
+        return call_openai(text, tgt), "openai"
+    raise RuntimeError(f"Invalid provider: {provider}")
 
-def translate_smart(text: str, tgt: str, force_provider: str | None = None) -> (str, str):
-    """
-    Try providers in order until one succeeds. Returns (translated_text, used_provider).
-    """
-    providers = [force_provider] if force_provider else PROVIDER_ORDER
-    errors = []
-    for p in providers:
-        if not p:
-            continue
+
+def translate_hf_with_fast_fallback(text: str, tgt: str):
+    """Try HF for FAST_FALLBACK_MS, then immediately fall back to OpenAI if no result."""
+    result = {"text": None, "err": None}
+
+    def run_hf():
         try:
-            result = translate_with_provider(p, text, tgt)
-            return result, p
+            model = HF_ENDPOINTS.get(tgt)
+            if not model:
+                raise RuntimeError(f"No HF model for {tgt}")
+            result["text"] = call_hf(model, text)
         except Exception as e:
-            print(f"Provider {p} failed:", str(e))
-            errors.append(f"{p}: {str(e)}")
-    raise RuntimeError(" / ".join(errors))
+            result["err"] = e
 
-# ---------- Routes ----------
-@app.get("/")
-def root():
-    return {"status": "ok", "message": "Translator running (HF + OpenAI fallback)."}
+    t = threading.Thread(target=run_hf, daemon=True)
+    t.start()
+    t.join(FAST_FALLBACK_MS / 1000.0)
+    if result["text"]:
+        return result["text"], "hf"
+    return call_openai(text, tgt), "openai"
 
-@app.get("/health")
-def health():
-    return {"status": "healthy"}
 
-@app.post("/translate")
-async def translate(request: Request):
+def translate_smart(text: str, tgt: str, force_provider=None):
+    """Select provider per config order, with retries."""
+    if force_provider:
+        return translate_with_provider(text, tgt, force_provider)
+
+    order = [p.strip() for p in PROVIDER_ORDER]
+    for prov in order:
+        try:
+            if prov == "hf":
+                if FAST_FALLBACK_MS > 0:
+                    return translate_hf_with_fast_fallback(text, tgt)
+                else:
+                    model = HF_ENDPOINTS.get(tgt)
+                    return call_hf(model, text), "hf"
+            elif prov == "openai":
+                return call_openai(text, tgt), "openai"
+        except Exception as e:
+            print(f"[WARN] {prov} failed: {e}")
+            continue
+    raise RuntimeError("All providers failed")
+
+
+# ------------------ ROUTES ------------------
+
+@app.route("/translate", methods=["POST"])
+def translate():
     try:
-        # Auth
         if request.headers.get("x-api-key") != API_KEY:
-            return JSONResponse(status_code=401, content={"status": "error", "message": "Unauthorized"})
+            return jsonify({"status": "error", "message": "Unauthorized"}), 401
 
-        # Parse
-        try:
-            body = await request.json()
-        except Exception:
-            return JSONResponse(status_code=400, content={"status": "error", "message": "Invalid JSON"})
+        data = request.get_json(force=True)
+        content_md = data.get("content_md", "").strip()
+        tgt = data.get("target_lang", "").strip()
+        force_provider = data.get("provider")
 
-        text = (body.get("content_md") or "").strip()
-        tgt = (body.get("target_lang") or "hi").strip().lower()
-        force_provider = (body.get("provider") or "").strip().lower() or None  # optional override
+        if not content_md or tgt not in HF_ENDPOINTS:
+            return jsonify({"status": "error", "message": "Invalid input"}), 400
 
-        if not text:
-            return JSONResponse(status_code=400, content={"status": "error", "message": "Missing 'content_md'"})
-        if tgt not in LANG_NAME:
-            return JSONResponse(status_code=400, content={"status": "error", "message": f"Unsupported target_lang '{tgt}'"})
+        chunks = chunk_text(content_md)
+        print(f"🔹 Translating {len(chunks)} chunk(s) to {tgt} via provider={force_provider or 'auto'}")
 
-        # Detect source
-        try:
-            src = detect(text)
-        except Exception:
-            src = "en"
+        full_output = []
+        used_provider = None
+        for i, ch in enumerate(chunks):
+            retries = 0
+            while retries < MAX_RETRIES:
+                try:
+                    out, prov = translate_smart(ch, tgt, force_provider)
+                    full_output.append(out)
+                    used_provider = prov
+                    break
+                except Exception as e:
+                    retries += 1
+                    print(f"[Retry {retries}] {e}")
+                    time.sleep(1.5)
+            else:
+                raise RuntimeError("Translation failed after retries")
 
-        if src == tgt:
-            return {
-                "status": "success",
-                "cached": True,
-                "provider": "none",
-                "data": {"detected_lang": src, "from": src, "to": tgt, "translated_text": text},
-            }
-
-        # Cache (provider-aware: because outputs differ slightly across engines)
-        k = cache_key(text, tgt, force_provider or ",".join(PROVIDER_ORDER))
-        if k in translation_cache:
-            payload = translation_cache[k] | {"cached": True}
-            return {"status": "success", **payload}
-
-        # Translate (smart order or forced)
-        result_text, used_provider = translate_smart(text, tgt, force_provider)
-
-        data = {
-            "detected_lang": src,
-            "from": src,
-            "to": tgt,
-            "translated_text": result_text,
-        }
-        translation_cache[k] = {"provider": used_provider, "data": data}
-
-        return {"status": "success", "cached": False, "provider": used_provider, "data": data}
+        translated = "\n".join(full_output)
+        return jsonify({
+            "status": "success",
+            "provider": used_provider or "none",
+            "data": {"translated_text": translated}
+        })
 
     except Exception as e:
-        print("SERVER ERROR:", str(e))
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+        print("❌ ERROR:", e)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.get("/warm")
+def warm():
+    """Ping endpoint to pre-warm the Render dyno."""
+    return jsonify({"status": "warm"})
+
+
+@app.get("/")
+def root():
+    return jsonify({"status": "ok", "message": "CrackPO Translator Agent active"})
+
+
+# ------------------ MAIN ------------------
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8000))
+    print(f"🚀 Starting Translator on port {port} | Providers: {PROVIDER_ORDER}")
+    app.run(host="0.0.0.0", port=port)
